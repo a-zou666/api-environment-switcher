@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# apictl — 一键切换 API 环境（bash / git bash / WSL）
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if command -v python >/dev/null 2>&1; then
+  exec python "$DIR/apictl.py" "$@"
+elif command -v python3 >/dev/null 2>&1; then
+  exec python3 "$DIR/apictl.py" "$@"
+else
+  echo "找不到 python，请先安装 Python 3.8+" >&2
+  exit 9009
+fi
