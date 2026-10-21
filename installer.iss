@@ -2,7 +2,7 @@
 ; 编译：ISCC.exe installer.iss
 
 #define MyAppName "API 环境切换器"
-#define MyAppVersion "1.6.4"
+#define MyAppVersion "1.7.2"
 #define MyAppExeName "API环境切换器.exe"
 
 [Setup]

@@ -19,7 +19,7 @@ import urllib.request
 from ctypes import wintypes
 from pathlib import Path
 
-VERSION = "1.6.4"
+VERSION = "1.7.2"
 APP_NAME = "API 环境切换器"
 
 CODEX_HOME = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
@@ -804,21 +804,89 @@ def _short_proxy(url):
     return url.replace("http://", "").replace("https://", "").rstrip("/")
 
 
-def _http_error(e, url, t0, via, proxy=""):
-    ms = int((time.time() - t0) * 1000)
-    detail = ""
+API_UA = f"apictl/{VERSION}"
+# 部分网关（new-api / one-api 系）按客户端指纹放行，只认官方 CLI 的 UA，
+# 其余一律回 "unauthorized client detected" 这种误导性的 401
+COMPAT_UA = "codex_cli_rs/0.20.0 (Windows 10.0; x86_64) WindowsTerminal"
+BLOCK_MARKS = ("unauthorized client", "unauthorized_client", "非法客户端",
+               "client detected", "forbidden client")
+
+
+def _is_html(body, ctype=""):
+    head = (body or "").lstrip()[:512].lower()
+    return ("text/html" in (ctype or "").lower()
+            or head.startswith("<!doctype") or head.startswith("<html"))
+
+
+def _client_blocked(body):
+    low = (body or "").lower()
+    return any(k in low for k in BLOCK_MARKS)
+
+
+def _api_bases(base):
+    """候选 API 根：网关多数把接口挂在 /v1 下，先试 /v1，再试原样"""
+    b = (base or "").rstrip("/")
+    if not b:
+        return []
+    if b.endswith(("/v1", "/v1beta")):
+        return [b]
+    return [b + "/v1", b]
+
+
+def _model_ids(body):
     try:
-        detail = e.read(300).decode("utf-8", "replace").replace("\n", " ").strip()
+        data = json.loads(body)
     except Exception:
-        pass
-    hint = "API Key 无效或没有权限" if e.code in (401, 403) else ""
-    if e.code == 404:
-        hint = "网关没有 /models 接口，但聊天接口可能是通的"
-    res = {"ok": False, "status": e.code, "ms": ms, "error": detail or f"HTTP {e.code}",
-           "hint": hint, "url": url, "via": via}
-    if proxy:
-        res["proxy"] = _short_proxy(proxy)
-    return res
+        return []
+    items = data.get("data") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return []
+    return [m.get("id") for m in items if isinstance(m, dict) and m.get("id")]
+
+
+def _hint_for(status, body):
+    low = (body or "").lower()
+    if _client_blocked(body):
+        return "网关按客户端身份放行，拒的是 apictl 的 UA，不是 key 本身"
+    if status == 402 or "quota" in low or "budget" in low or "额度" in low:
+        return "上游额度池已耗尽；令牌面板显示「无限额度」不代表供应商侧还有额度"
+    if status == 503 or "无可用渠道" in low or "no available channel" in low:
+        return "该分组下这个模型没有可用渠道，换个模型或换个分组"
+    if status in (401, 403):
+        return "API Key 无效或没有权限"
+    if status == 404:
+        return "网关没有 /models 接口，但聊天接口可能是通的"
+    if status == 429:
+        return "请求太频繁，被上游限流"
+    return ""
+
+
+def _probe(url, key, proxy, timeout, ua=API_UA):
+    """请求一次 /models，把 HTML 页面、HTTP 错误、网络异常分开报告"""
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": ua,
+        },
+    )
+    try:
+        with _opener(proxy).open(req, timeout=timeout) as r:
+            ctype = r.headers.get("Content-Type", "") or ""
+            body = r.read(8000).decode("utf-8", "replace")
+            return {"kind": "html" if _is_html(body, ctype) else "body",
+                    "status": r.status, "body": body}
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read(600).decode("utf-8", "replace").strip()
+        except Exception:
+            pass
+        return {"kind": "http", "status": e.code, "body": detail}
+    except Exception as e:
+        return {"kind": "exc", "error": e}
 
 
 def test_endpoint(profile, timeout=15):
@@ -828,15 +896,6 @@ def test_endpoint(profile, timeout=15):
     if not base or not key:
         return {"ok": False, "error": "缺少网关地址或 API Key", "hint": ""}
 
-    url = base + "/models"
-    req = urllib.request.Request(
-        url,
-        headers={
-            "Authorization": f"Bearer {key}",
-            "Content-Type": "application/json",
-            "User-Agent": f"apictl/{VERSION}",
-        },
-    )
     host = host_of(base)
     is_local = host.startswith(("127.", "localhost", "0.0.0.0", "192.168.", "10.", "::1"))
     proxy = "" if is_local else detect_proxy()
@@ -845,33 +904,62 @@ def test_endpoint(profile, timeout=15):
     if proxy:
         routes.append(("proxy", proxy, max(timeout, 12)))
 
-    t0 = time.time()
+    html_hit = None
     last_exc = None
-    for via, px, tmo in routes:
-        try:
-            with _opener(px).open(req, timeout=tmo) as r:
-                body = r.read(8000).decode("utf-8", "replace")
-                ms = int((time.time() - t0) * 1000)
-                models = []
-                try:
-                    data = json.loads(body)
-                    items = data.get("data") if isinstance(data, dict) else None
-                    if isinstance(items, list):
-                        models = [m.get("id") for m in items
-                                  if isinstance(m, dict) and m.get("id")]
-                except Exception:
-                    pass
-                res = {"ok": True, "status": r.status, "ms": ms, "models": models,
-                       "url": url, "via": via}
+    for api_base in _api_bases(base):
+        url = api_base + "/models"
+        for via, px, tmo in routes:
+            t0 = time.time()
+            r = _probe(url, key, px, tmo)
+            ms = int((time.time() - t0) * 1000)
+            compat = False
+
+            # 网关按 UA 拦人时，换个官方 CLI 身份再试一次
+            if r["kind"] == "http" and _client_blocked(r["body"]):
+                again = _probe(url, key, px, tmo, COMPAT_UA)
+                if again["kind"] in ("body", "html"):
+                    r, compat = again, True
+                elif again["kind"] == "http":
+                    r = again
+
+            if r["kind"] == "body":
+                res = {"ok": True, "status": r["status"], "ms": ms,
+                       "models": _model_ids(r["body"]), "url": url,
+                       "api_base": api_base, "via": via}
+                if compat:
+                    res["compat_ua"] = True
                 if via == "proxy":
                     res["proxy"] = _short_proxy(px)
+                if api_base != base:
+                    res["fix_base"] = api_base
                 return res
-        except urllib.error.HTTPError as e:
-            # 能收到 HTTP 响应说明链路本身是通的，直接按业务错误返回
-            return _http_error(e, url, t0, via, px)
-        except Exception as e:
-            last_exc = e
+
+            if r["kind"] == "html":
+                # 打到网关的网页控制台了：这个 base 不对，换下一个候选
+                html_hit = {"status": r["status"], "url": url, "ms": ms,
+                            "via": via, "api_base": api_base}
+                break
+
+            if r["kind"] == "http":
+                out = {"ok": False, "status": r["status"], "ms": ms,
+                       "error": (r["body"] or f"HTTP {r['status']}")[:300],
+                       "hint": _hint_for(r["status"], r["body"]), "url": url,
+                       "api_base": api_base, "via": via}
+                if compat:
+                    out["compat_ua"] = True
+                if via == "proxy":
+                    out["proxy"] = _short_proxy(px)
+                return out
+
+            last_exc = r.get("error")
             continue
+
+    if html_hit:
+        return {"ok": False, "status": html_hit["status"], "ms": html_hit["ms"],
+                "error": f"{html_hit['url']} 返回的是网页（HTML），不是接口 JSON",
+                "hint": "网关地址少了 /v1，改成 "
+                        + html_hit["url"].rsplit("/models", 1)[0] + " 再试",
+                "url": html_hit["url"], "via": html_hit["via"]}
 
     msg = str(last_exc or "连接失败")
     low = msg.lower()
@@ -886,7 +974,7 @@ def test_endpoint(profile, timeout=15):
         hint = "目标没有服务在监听"
     if proxy:
         hint = (hint + " · " if hint else "") + f"已试过代理 {_short_proxy(proxy)}"
-    return {"ok": False, "status": None, "error": msg, "hint": hint, "url": url, "via": ""}
+    return {"ok": False, "status": None, "error": msg, "hint": hint, "url": "/".join(_api_bases(base)) + "/models", "via": ""}
 
 
 def fetch_models(base_url, api_key, timeout=15):
@@ -898,10 +986,16 @@ def fetch_models(base_url, api_key, timeout=15):
     r = test_endpoint({"base_url": base_url, "api_key": api_key}, timeout=timeout)
     if r.get("ok"):
         models = sorted({m for m in (r.get("models") or []) if m}, key=str.lower)
-        return {"ok": True, "models": models, "ms": r.get("ms", 0),
-                "via": r.get("via"), "proxy": r.get("proxy", "")}
+        out = {"ok": True, "models": models, "ms": r.get("ms", 0),
+               "via": r.get("via"), "proxy": r.get("proxy", ""),
+               "api_base": r.get("api_base")}
+        for k in ("fix_base", "compat_ua"):
+            if r.get(k):
+                out[k] = r[k]
+        return out
     return {"ok": False, "status": r.get("status"), "error": r.get("error"),
-            "hint": r.get("hint"), "via": r.get("via")}
+            "hint": r.get("hint"), "via": r.get("via"),
+            "api_base": r.get("api_base")}
 
 
 # ---------------------------------------------------------------- 客户端检测
